@@ -842,6 +842,195 @@ describe('Tracer', () => {
 
       expect(() => tracer.endToolCallSpan(null)).not.toThrow()
     })
+
+    it('ends each concurrent local tool trace independently at its own completion time', () => {
+      let now = 1000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      mockStartSpan.mockImplementation(() => new MockSpan())
+
+      try {
+        const tracer = new Tracer()
+        const cycleSpan = tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        const spanA = tracer.startToolCallSpan({ tool: { name: 'slow_a', toolUseId: 'id-a', input: {} } })
+        const spanB = tracer.startToolCallSpan({ tool: { name: 'slow_b', toolUseId: 'id-b', input: {} } })
+
+        now = 1050
+        tracer.endToolCallSpan(spanA, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-a', status: 'success', content: [new TextBlock('a')] }),
+        })
+
+        now = 1100
+        tracer.endToolCallSpan(spanB, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-b', status: 'success', content: [new TextBlock('b')] }),
+        })
+
+        tracer.endAgentLoopSpan(cycleSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({
+          name: 'Tool: slow_a',
+          startTime: 1000,
+          endTime: 1050,
+          duration: 50,
+          metadata: { toolUseId: 'id-a', toolName: 'slow_a' },
+        })
+        expect(traceB).toMatchObject({
+          name: 'Tool: slow_b',
+          startTime: 1000,
+          endTime: 1100,
+          duration: 100,
+          metadata: { toolUseId: 'id-b', toolName: 'slow_b' },
+        })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('correlates concurrent local tool traces by toolUseId when span creation fails and returns null', () => {
+      let now = 2000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      mockStartSpan.mockImplementation(() => {
+        throw new Error('otel unavailable')
+      })
+
+      try {
+        const tracer = new Tracer()
+        const cycleSpan = tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        const spanA = tracer.startToolCallSpan({ tool: { name: 'slow_a', toolUseId: 'id-a', input: {} } })
+        const spanB = tracer.startToolCallSpan({ tool: { name: 'slow_b', toolUseId: 'id-b', input: {} } })
+        expect(spanA).toBeNull()
+        expect(spanB).toBeNull()
+
+        now = 2050
+        tracer.endToolCallSpan(spanA, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-a', status: 'success', content: [new TextBlock('a')] }),
+        })
+
+        now = 2120
+        tracer.endToolCallSpan(spanB, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-b', status: 'success', content: [new TextBlock('b')] }),
+        })
+
+        tracer.endAgentLoopSpan(cycleSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({ name: 'Tool: slow_a', endTime: 2050, duration: 50 })
+        expect(traceB).toMatchObject({ name: 'Tool: slow_b', endTime: 2120, duration: 120 })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('correlates concurrent local tool traces when a mock returns the same span instance', () => {
+      let now = 3000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+      try {
+        const tracer = new Tracer()
+        const cycleSpan = tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        const spanA = tracer.startToolCallSpan({ tool: { name: 'slow_a', toolUseId: 'id-a', input: {} } })
+        const spanB = tracer.startToolCallSpan({ tool: { name: 'slow_b', toolUseId: 'id-b', input: {} } })
+        expect(spanA).toBe(spanB)
+
+        now = 3040
+        tracer.endToolCallSpan(spanB, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-b', status: 'success', content: [new TextBlock('b')] }),
+        })
+
+        now = 3090
+        tracer.endToolCallSpan(spanA, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-a', status: 'success', content: [new TextBlock('a')] }),
+        })
+
+        tracer.endAgentLoopSpan(cycleSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({ name: 'Tool: slow_a', endTime: 3090, duration: 90 })
+        expect(traceB).toMatchObject({ name: 'Tool: slow_b', endTime: 3040, duration: 40 })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('matches concurrent local tool trace by span when ended with error and no toolResult', () => {
+      let now = 4000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      mockStartSpan.mockImplementation(() => new MockSpan())
+
+      try {
+        const tracer = new Tracer()
+        const cycleSpan = tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        const spanA = tracer.startToolCallSpan({ tool: { name: 'slow_a', toolUseId: 'id-a', input: {} } })
+        const spanB = tracer.startToolCallSpan({ tool: { name: 'slow_b', toolUseId: 'id-b', input: {} } })
+
+        now = 4030
+        tracer.endToolCallSpan(spanA, { error: new Error('tool A failed') })
+
+        now = 4100
+        tracer.endToolCallSpan(spanB, {
+          toolResult: new ToolResultBlock({ toolUseId: 'id-b', status: 'success', content: [new TextBlock('b')] }),
+        })
+
+        tracer.endAgentLoopSpan(cycleSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({ name: 'Tool: slow_a', endTime: 4030, duration: 30 })
+        expect(traceB).toMatchObject({ name: 'Tool: slow_b', endTime: 4100, duration: 100 })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('ends any remaining in-flight tool traces when endAgentLoopSpan runs', () => {
+      let now = 5000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      mockStartSpan.mockImplementation(() => new MockSpan())
+
+      try {
+        const tracer = new Tracer()
+        const cycleSpan = tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        tracer.startToolCallSpan({ tool: { name: 'orphan_a', toolUseId: 'id-a', input: {} } })
+        tracer.startToolCallSpan({ tool: { name: 'orphan_b', toolUseId: 'id-b', input: {} } })
+
+        now = 5075
+        tracer.endAgentLoopSpan(cycleSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({ name: 'Tool: orphan_a', endTime: 5075, duration: 75 })
+        expect(traceB).toMatchObject({ name: 'Tool: orphan_b', endTime: 5075, duration: 75 })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('ends any remaining in-flight tool traces when endAgentSpan runs', () => {
+      let now = 6000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      mockStartSpan.mockImplementation(() => new MockSpan())
+
+      try {
+        const tracer = new Tracer()
+        const agentSpan = tracer.startAgentSpan({ messages: [], agentName: 'test-agent' })
+        tracer.startAgentLoopSpan({ cycleId: 'cycle-1', messages: [] })
+
+        tracer.startToolCallSpan({ tool: { name: 'orphan_a', toolUseId: 'id-a', input: {} } })
+        tracer.startToolCallSpan({ tool: { name: 'orphan_b', toolUseId: 'id-b', input: {} } })
+
+        now = 6060
+        tracer.endAgentSpan(agentSpan)
+
+        const [traceA, traceB] = tracer.localTraces[0]!.children
+        expect(traceA).toMatchObject({ name: 'Tool: orphan_a', endTime: 6060, duration: 60 })
+        expect(traceB).toMatchObject({ name: 'Tool: orphan_b', endTime: 6060, duration: 60 })
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
   })
 
   describe('startAgentLoopSpan', () => {

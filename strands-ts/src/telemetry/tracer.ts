@@ -138,6 +138,15 @@ export class AgentTrace implements JSONSerializable<AgentTraceData> {
 }
 
 /**
+ * An in-flight tool call's local trace correlated with its OTel span and toolUseId.
+ */
+interface ActiveToolTrace {
+  trace: AgentTrace
+  toolUseId: string
+  span: Span | null
+}
+
+/**
  * In-memory execution trace state, collected independently of OTel.
  * Always active regardless of whether setupTracer() has been called.
  */
@@ -148,8 +157,8 @@ interface AgentTraceState {
   currentCycle?: AgentTrace | undefined
   /** Current model invocation trace. */
   currentModel?: AgentTrace | undefined
-  /** Current tool call trace. */
-  currentTool?: AgentTrace | undefined
+  /** In-flight tool call traces, tracked independently for concurrent tool execution. */
+  activeTools: ActiveToolTrace[]
 }
 
 /**
@@ -230,7 +239,7 @@ export class Tracer {
   private readonly _spanAttributesOnly: boolean
 
   /** In-memory execution trace state, collected independently of OTEL. */
-  private readonly _traceState: AgentTraceState = { traces: [] }
+  private readonly _traceState: AgentTraceState = { traces: [], activeTools: [] }
 
   /**
    * Initialize the tracer with OpenTelemetry configuration.
@@ -276,7 +285,7 @@ export class Tracer {
     this._traceState.traces = []
     this._traceState.currentCycle = undefined
     this._traceState.currentModel = undefined
-    this._traceState.currentTool = undefined
+    this._traceState.activeTools = []
 
     try {
       const spanName = `invoke_agent ${agentName}`
@@ -331,9 +340,9 @@ export class Tracer {
     this._loopSpan = undefined
 
     // Clear local trace state
+    this._endActiveToolTraces()
     this._traceState.currentCycle = undefined
     this._traceState.currentModel = undefined
-    this._traceState.currentTool = undefined
 
     if (!span) return
 
@@ -442,7 +451,8 @@ export class Tracer {
     )
     toolTrace.metadata.toolUseId = tool.toolUseId
     toolTrace.metadata.toolName = tool.name
-    this._traceState.currentTool = toolTrace
+    const activeTool: ActiveToolTrace = { trace: toolTrace, toolUseId: tool.toolUseId, span: null }
+    this._traceState.activeTools.push(activeTool)
 
     try {
       const attributes = this._getCommonAttributes('execute_tool')
@@ -485,6 +495,7 @@ export class Tracer {
         })
       }
 
+      activeTool.span = span
       return span
     } catch (error) {
       logger.warn(`error=<${error}> | failed to start tool call span`)
@@ -499,10 +510,10 @@ export class Tracer {
    * @param options - Options for ending the tool call span
    */
   endToolCallSpan(span: Span | null, options: EndToolCallSpanOptions = {}): void {
-    // End local tool trace
-    if (this._traceState.currentTool) {
-      this._traceState.currentTool.end()
-      this._traceState.currentTool = undefined
+    // End matching local tool trace
+    const toolTrace = this._popActiveToolTrace(span, options.toolResult?.toolUseId)
+    if (toolTrace) {
+      toolTrace.end()
     }
 
     if (!span) return
@@ -942,6 +953,8 @@ export class Tracer {
    * @param options - Options for ending the agent loop span
    */
   endAgentLoopSpan(span: Span | null, options: EndAgentLoopSpanOptions = {}): void {
+    this._endActiveToolTraces()
+
     // End local cycle trace
     if (this._traceState.currentCycle) {
       this._traceState.currentCycle.end()
@@ -955,6 +968,44 @@ export class Tracer {
     } catch (err) {
       logger.warn(`error=<${err}> | failed to end agent loop cycle span`)
     }
+  }
+
+  /**
+   * Find and remove the active local tool trace matching the ended tool call.
+   * Prefers matching both span and toolUseId, falling back to span alone (e.g., when
+   * no toolResult is provided on interrupt/error), toolUseId alone (when span creation
+   * failed and returned null), or an untracked null-span entry when neither is available.
+   */
+  private _popActiveToolTrace(span: Span | null, toolUseId?: string): AgentTrace | undefined {
+    const active = this._traceState.activeTools
+    if (active.length === 0) return undefined
+
+    let index = -1
+    if (span !== null && toolUseId !== undefined) {
+      index = active.findIndex((entry) => entry.span === span && entry.toolUseId === toolUseId)
+    }
+    if (index === -1 && span !== null) {
+      index = active.findIndex((entry) => entry.span === span)
+    }
+    if (index === -1 && toolUseId !== undefined) {
+      index = active.findIndex((entry) => entry.toolUseId === toolUseId)
+    }
+    if (index === -1 && span === null && toolUseId === undefined) {
+      index = active.findIndex((entry) => entry.span === null)
+    }
+
+    if (index === -1) return undefined
+    return active.splice(index, 1)[0]!.trace
+  }
+
+  /**
+   * End and clear any in-flight local tool traces (e.g., on cycle or agent teardown after abort/error).
+   */
+  private _endActiveToolTraces(): void {
+    for (const entry of this._traceState.activeTools) {
+      entry.trace.end()
+    }
+    this._traceState.activeTools = []
   }
 
   /**

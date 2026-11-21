@@ -729,4 +729,33 @@ describe('Agent concurrent tool execution', () => {
 
     endToolCallSpan.mockRestore()
   })
+
+  it('ends local tool traces independently for concurrent tool calls', async () => {
+    const toolA = new GatedTool('toolA')
+    const toolB = new GatedTool('toolB')
+    const agent = new Agent({
+      model: twoToolTurn(),
+      tools: [toolA, toolB],
+      printer: false,
+    })
+
+    const invocation = agent.invoke('Go')
+    await Promise.all([toolA.started, toolB.started])
+
+    toolA.release()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    toolB.release()
+
+    const result = await invocation
+    const toolTraces = result.traces?.[0]?.children.filter((t) => t.name.startsWith('Tool: ')) ?? []
+    expect(toolTraces).toHaveLength(2)
+
+    const traceA = toolTraces.find((t) => t.metadata.toolUseId === 'a')!
+    const traceB = toolTraces.find((t) => t.metadata.toolUseId === 'b')!
+
+    expect(traceA.endTime).not.toBeNull()
+    expect(traceB.endTime).not.toBeNull()
+    expect(traceB.endTime!).toBeGreaterThan(traceA.endTime!)
+    expect(traceB.duration).toBeGreaterThan(traceA.duration)
+  })
 })
