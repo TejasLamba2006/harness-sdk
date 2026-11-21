@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ToolContext } from '../../../tools/tool.js'
 import type { LocalAgent } from '../../../types/agent.js'
+import type { JSONValue } from '../../../types/json.js'
 import { httpRequest } from '../http-request.js'
 
 describe('httpRequest tool', () => {
@@ -202,25 +203,107 @@ describe('httpRequest tool', () => {
   })
 
   describe('error handling', () => {
-    it('throws timeout error when request exceeds timeout', async () => {
-      globalThis.fetch = vi.fn().mockImplementation(
-        async (_url, _options) =>
-          new Promise((_resolve, reject) => {
-            globalThis.setTimeout(() => {
-              const error = new Error('The operation was aborted')
-              error.name = 'AbortError'
-              reject(error)
-            }, 100)
-          })
-      )
+    const createAbortingFetch = (
+      errorFactory?: (signal: AbortSignal) => unknown
+    ): ReturnType<typeof vi.fn<typeof globalThis.fetch>> =>
+      vi.fn((_url, options) => {
+        const signal = options?.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          const onAbort = (): void => reject(errorFactory ? errorFactory(signal) : signal.reason)
+          if (signal.aborted) {
+            onAbort()
+            return
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+        })
+      })
+
+    const createContext = (
+      input: JSONValue,
+      cancelSignal: AbortSignal,
+      agentCancelSignal: AbortSignal = new AbortController().signal
+    ): ToolContext => ({
+      toolUse: {
+        name: 'http_request',
+        toolUseId: 'task-http',
+        input,
+      },
+      agent: { cancelSignal: agentCancelSignal } as LocalAgent,
+      invocationState: {},
+      cancelSignal,
+      interrupt: vi.fn() as ToolContext['interrupt'],
+    })
+
+    it('throws formatted timeout error when AbortSignal.timeout fires with TimeoutError', async () => {
+      globalThis.fetch = createAbortingFetch()
+
+      const err = await httpRequest
+        .invoke({
+          method: 'GET',
+          url: 'https://slow-api.example.com',
+          timeout: 0.05,
+        })
+        .catch((e: unknown) => e)
+
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toBe('Request timed out after 0.05 seconds: GET https://slow-api.example.com')
+      expect((err as Error).cause).toMatchObject({ name: 'TimeoutError' })
+    })
+
+    it('throws formatted timeout error when fetch rejects with AbortError after timeout', async () => {
+      globalThis.fetch = createAbortingFetch(() => new DOMException('The operation was aborted', 'AbortError'))
 
       await expect(
         httpRequest.invoke({
           method: 'GET',
           url: 'https://slow-api.example.com',
-          timeout: 0.1,
+          timeout: 0.05,
         })
-      ).rejects.toThrow('Request timed out')
+      ).rejects.toThrow('Request timed out after 0.05 seconds: GET https://slow-api.example.com')
+    })
+
+    it('throws formatted timeout error when timeout fires while reading response body', async () => {
+      globalThis.fetch = vi.fn((_url, options) => {
+        const signal = options?.signal as AbortSignal
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Map([]),
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            }),
+        } as unknown as Response)
+      })
+
+      await expect(
+        httpRequest.invoke({
+          method: 'GET',
+          url: 'https://slow-body.example.com',
+          timeout: 0.05,
+        })
+      ).rejects.toThrow('Request timed out after 0.05 seconds: GET https://slow-body.example.com')
+    })
+
+    it('throws formatted timeout error when context.cancelSignal is present but not aborted', async () => {
+      globalThis.fetch = createAbortingFetch()
+      const executionController = new AbortController()
+      const context = createContext(
+        { method: 'GET', url: 'https://slow-api.example.com', timeout: 0.05 },
+        executionController.signal
+      )
+
+      await expect(
+        httpRequest.invoke(
+          {
+            method: 'GET',
+            url: 'https://slow-api.example.com',
+            timeout: 0.05,
+          },
+          context
+        )
+      ).rejects.toThrow('Request timed out after 0.05 seconds: GET https://slow-api.example.com')
     })
 
     it('throws error for network failures', async () => {
@@ -247,17 +330,11 @@ describe('httpRequest tool', () => {
       })
       const executionController = new AbortController()
       const agentController = new AbortController()
-      const context: ToolContext = {
-        toolUse: {
-          name: 'http_request',
-          toolUseId: 'task-http',
-          input: { method: 'GET', url: 'https://slow-api.example.com' },
-        },
-        agent: { cancelSignal: agentController.signal } as LocalAgent,
-        invocationState: {},
-        cancelSignal: executionController.signal,
-        interrupt: vi.fn() as ToolContext['interrupt'],
-      }
+      const context = createContext(
+        { method: 'GET', url: 'https://slow-api.example.com' },
+        executionController.signal,
+        agentController.signal
+      )
 
       const request = httpRequest.invoke(
         {
@@ -271,6 +348,46 @@ describe('httpRequest tool', () => {
       executionController.abort()
 
       await cancelled
+    })
+
+    it('reports cancelled when context.cancelSignal is a shorter AbortSignal.timeout', async () => {
+      globalThis.fetch = createAbortingFetch()
+      const context = createContext(
+        { method: 'GET', url: 'https://slow-api.example.com', timeout: 30 },
+        AbortSignal.timeout(50)
+      )
+
+      await expect(
+        httpRequest.invoke(
+          {
+            method: 'GET',
+            url: 'https://slow-api.example.com',
+            timeout: 30,
+          },
+          context
+        )
+      ).rejects.toThrow('Request cancelled: GET https://slow-api.example.com')
+    })
+
+    it('reports cancelled when context.cancelSignal aborts with a custom reason', async () => {
+      globalThis.fetch = createAbortingFetch()
+      const executionController = new AbortController()
+      const customReason = new Error('user cancelled')
+      const context = createContext({ method: 'GET', url: 'https://slow-api.example.com' }, executionController.signal)
+
+      const request = httpRequest.invoke(
+        {
+          method: 'GET',
+          url: 'https://slow-api.example.com',
+        },
+        context
+      )
+      executionController.abort(customReason)
+
+      const err = await request.catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toBe('Request cancelled: GET https://slow-api.example.com')
+      expect((err as Error).cause).toBe(customReason)
     })
   })
 })
